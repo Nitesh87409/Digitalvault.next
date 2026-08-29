@@ -1,0 +1,321 @@
+import { NextResponse } from "next/server";
+import bcrypt from "bcryptjs";
+import connectDB from "@/lib/mongodb";
+import Customer from "@/models/Customer";
+import Setting from "@/models/Setting";
+import { generateToken, verifyCustomer } from "@/lib/auth";
+import { buildRateLimitKey, consumePersistentRateLimit } from "@/lib/security";
+import { hasActiveBundleAccess } from "@/lib/bundle-access";
+
+const CUSTOMER_AUTH_LIMIT = { limit: 5, windowMs: 60_000 };
+
+function deny(message, status = 400) {
+  return NextResponse.json({ flag: 0, message }, { status });
+}
+
+function normalizeEmail(value) {
+  return typeof value === "string" ? value.toLowerCase().trim() : "";
+}
+
+function normalizePhone(value) {
+  const digits = typeof value === "string" ? value.replace(/\D/g, "") : "";
+  if (digits.length === 12 && digits.startsWith("91")) return digits.slice(2);
+  if (digits.length === 11 && digits.startsWith("0")) return digits.slice(1);
+  return digits;
+}
+
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function isValidPhone(value) {
+  return /^\d{10}$/.test(value);
+}
+
+async function isPasswordAuthEnabled() {
+  const settings = await Setting.findOne().lean();
+  return settings?.password_login_enabled !== false;
+}
+
+async function findCustomerByContact(email, phone) {
+  const matches = await Customer.find({
+    $or: [
+      { email },
+      { phone },
+    ],
+  }).limit(2);
+
+  const uniqueMatches = new Map(matches.map(customer => [customer._id.toString(), customer]));
+  if (uniqueMatches.size > 1) {
+    return { error: deny("Email and phone belong to different accounts. Please use matching details.", 409) };
+  }
+
+  return { customer: matches[0] || null };
+}
+
+async function buildAuthResponse(customer, message) {
+  const isPremium = await hasActiveBundleAccess(customer._id);
+  const token = generateToken({ id: customer._id, email: customer.email, name: customer.name, role: "customer" }, "24h");
+  const response = NextResponse.json({
+    flag: 1,
+    message,
+    customer: {
+      id: customer._id,
+      name: customer.name,
+      email: customer.email,
+      phone: customer.phone,
+      createdAt: customer.createdAt,
+      is_blocked: customer.is_blocked,
+      is_premium: isPremium
+    },
+  });
+
+  response.cookies.set({
+    name: "dv_token",
+    value: token,
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    maxAge: 24 * 60 * 60,
+    path: "/",
+  });
+
+  return response;
+}
+
+export async function POST(request) {
+  try {
+    await connectDB();
+
+    const body = await request.json();
+    const action = typeof body?.action === "string" ? body.action.trim() : "";
+
+    if (!action) {
+      return deny("Invalid action", 400);
+    }
+
+    if (action === "email-phone") {
+      const email = normalizeEmail(body?.email);
+      const phone = normalizePhone(body?.phone);
+
+      if (!isValidEmail(email)) {
+        return deny("Valid email address required", 400);
+      }
+      if (!isValidPhone(phone)) {
+        return deny("Valid 10-digit phone number required", 400);
+      }
+
+      const rateLimit = await consumePersistentRateLimit(buildRateLimitKey(request, "customer-email-phone", `${email}:${phone}`), CUSTOMER_AUTH_LIMIT);
+      if (!rateLimit.allowed) {
+        return deny("Too many requests. Please try again later.", 429);
+      }
+
+      const { customer, error } = await findCustomerByContact(email, phone);
+      if (error) return error;
+
+      if (customer) {
+        if (customer.is_blocked) {
+          return deny("Your account is blocked. Please contact support.", 403);
+        }
+        if ((customer.email && normalizeEmail(customer.email) !== email) || (customer.phone && normalizePhone(customer.phone) !== phone)) {
+          return deny("Email and phone do not match the existing account.", 409);
+        }
+
+        let changed = false;
+        if (!customer.email) {
+          customer.email = email;
+          changed = true;
+        }
+        if (!customer.phone) {
+          customer.phone = phone;
+          changed = true;
+        }
+        if (changed) {
+          await customer.save();
+        }
+
+        return NextResponse.json({
+          flag: 1,
+          requires_otp: true,
+          message: "OTP verification required",
+          email,
+        });
+      }
+
+      const newCustomer = await Customer.create({
+        name: "Guest",
+        email,
+        phone,
+        password: "",
+        auth_provider: "local",
+        is_verified: true,
+        is_blocked: false,
+        last_login: new Date(),
+      });
+
+      return buildAuthResponse(newCustomer, "Account created");
+    }
+
+    if (action === "silent-guest-login") {
+      const email = normalizeEmail(body?.email);
+      const phone = normalizePhone(body?.phone);
+
+      if (!isValidEmail(email)) {
+        return deny("Valid email address required", 400);
+      }
+      if (!isValidPhone(phone)) {
+        return deny("Valid 10-digit phone number required", 400);
+      }
+
+      const { customer, error } = await findCustomerByContact(email, phone);
+      if (error) return error;
+
+      if (customer) {
+        if (customer.is_blocked) {
+          return deny("Your account is blocked. Please contact support.", 403);
+        }
+        if ((customer.email && normalizeEmail(customer.email) !== email) || (customer.phone && normalizePhone(customer.phone) !== phone)) {
+          return deny("Email and phone do not match the existing account.", 409);
+        }
+
+        let changed = false;
+        if (!customer.email) {
+          customer.email = email;
+          changed = true;
+        }
+        if (!customer.phone) {
+          customer.phone = phone;
+          changed = true;
+        }
+        if (changed) {
+          await customer.save();
+        }
+
+        await Customer.updateOne({ _id: customer._id }, { $set: { last_login: new Date() } });
+        return buildAuthResponse(customer, "Login successful");
+      }
+
+      const newCustomer = await Customer.create({
+        name: "Guest",
+        email,
+        phone,
+        password: "",
+        auth_provider: "local",
+        is_verified: true,
+        is_blocked: false,
+        last_login: new Date(),
+      });
+
+      return buildAuthResponse(newCustomer, "Account created");
+    }
+
+
+
+    return deny("Invalid action", 400);
+  } catch (e) {
+    console.error("[Customer] POST error:", e);
+    if (e.code === 11000) {
+      if (e.keyPattern?.email) return deny("Email already registered", 400);
+      if (e.keyPattern?.phone) return deny("Phone number already in use", 400);
+    }
+    return deny("Server error", 500);
+  }
+}
+
+export async function PUT(request) {
+  try {
+    await connectDB();
+
+    const decoded = verifyCustomer(request);
+    if (!decoded) return deny("Unauthorized", 401);
+
+    const body = await request.json();
+    const action = typeof body?.action === "string" ? body.action.trim() : "";
+    const account = await Customer.findById(decoded.id);
+
+    if (!account || account.is_blocked) {
+      return deny("Unauthorized", 401);
+    }
+
+    if (action === "update") {
+      const name = typeof body?.name === "string" ? body.name.trim() : "";
+      const phone = typeof body?.phone === "string" ? body.phone.trim() : "";
+      const email = typeof body?.email === "string" ? body.email.trim() : account.email;
+
+      if (!name) return deny("Name is required", 400);
+
+      if (email && email !== account.email) {
+        const emailExists = await Customer.findOne({ email, _id: { $ne: account._id } }).select('_id').lean();
+        if (emailExists) {
+          return deny("Email already registered", 400);
+        }
+        account.email = email;
+      }
+
+      if (phone && phone !== account.phone) {
+        const phoneExists = await Customer.findOne({ phone, _id: { $ne: account._id } }).select('_id').lean();
+        if (phoneExists) {
+          return deny("Phone number already in use", 400);
+        }
+      }
+      
+      account.name = name;
+      account.phone = phone;
+      await account.save();
+
+      return NextResponse.json({
+        flag: 1,
+        message: "Profile updated",
+        customer: {
+          id: account._id,
+          name: account.name,
+          email: account.email,
+          phone: account.phone,
+          createdAt: account.createdAt,
+          is_blocked: account.is_blocked
+        },
+      });
+    }
+
+
+    return deny("Invalid action", 400);
+  } catch (e) {
+    console.error("[Customer] PUT error:", e);
+    if (e.code === 11000) {
+      if (e.keyPattern?.email) return deny("Email already registered", 400);
+      if (e.keyPattern?.phone) return deny("Phone number already in use", 400);
+    }
+    return deny("Server error", 500);
+  }
+}
+
+export async function GET(request) {
+  try {
+    await connectDB();
+
+    const decoded = verifyCustomer(request);
+    if (!decoded) return NextResponse.json({ flag: 0, customer: null });
+
+    const account = await Customer.findById(decoded.id).select('_id name email phone createdAt is_blocked password').lean();
+    if (!account) return deny("User not found", 404);
+    if (account.is_blocked) return deny("Your account is blocked", 403);
+
+    const isPremium = await hasActiveBundleAccess(account._id);
+
+    return NextResponse.json({
+      flag: 1,
+      customer: {
+        id: account._id,
+        name: account.name,
+        email: account.email,
+        phone: account.phone,
+        createdAt: account.createdAt,
+        is_blocked: account.is_blocked,
+        is_premium: isPremium
+      }
+    });
+  } catch (e) {
+    console.error("[Customer] GET error:", e);
+    return deny("Server error", 500);
+  }
+}

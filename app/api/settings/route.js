@@ -1,0 +1,136 @@
+import { NextResponse } from 'next/server';
+import connectDB from '@/lib/mongodb';
+import Setting from '@/models/Setting';
+import { verifyAdmin } from '@/lib/auth';
+import { getAdminSettings, getPublicSettings } from '@/lib/security';
+import { sanitizeRichText } from '@/lib/sanitize-content';
+
+export const dynamic = 'force-dynamic';
+
+export async function GET(request) {
+  try {
+    await connectDB();
+    const admin = verifyAdmin(request);
+    const settings = (await Setting.findOne().lean()) || {};
+
+    return NextResponse.json({
+      flag: 1,
+      settings: admin ? getAdminSettings(settings) : getPublicSettings(settings),
+    });
+  } catch (e) {
+    console.error('[Settings] GET error:', e);
+    return NextResponse.json({ flag: 0, message: 'Server error' }, { status: 500 });
+  }
+}
+
+export async function POST(request) {
+  try {
+    await connectDB();
+    const admin = verifyAdmin(request);
+    if (!admin) return NextResponse.json({ flag: 0, message: 'Unauthorized' }, { status: 401 });
+
+    const payload = await request.json();
+
+    let settings = await Setting.findOne();
+    if (!settings) {
+      settings = new Setting();
+    }
+
+    const fields = [
+      'password_login_enabled',
+      'email_otp_enabled',
+      'mobile_otp_enabled',
+      'google_login_enabled',
+      'apple_login_enabled',
+      'otp_expiry_minutes',
+      'otp_max_attempts',
+      'otp_length',
+      'otp_resend_cooldown_seconds',
+      'support_email',
+      'support_phone',
+      'business_hours',
+      'app_name',
+      'app_alt_name',
+      'app_logo',
+      'app_name_size',
+      'bundle_enabled',
+      'bundle_title',
+      'bundle_description',
+      'bundle_price',
+      'bundle_original_price',
+      'bundle_timer_enabled',
+      'bundle_timer_days',
+      'bundle_timer_hours',
+      'bundle_timer_minutes',
+      'bundle_timer_action',
+      'bundle_features',
+      'bundle_badge_text',
+      'bundle_badge_color',
+      'bundle_cta_text',
+      'bundle_show_discount',
+      'bundle_banner_image',
+      'bundle_sales_limit',
+      'bundle_validity_days',
+      'bundle_allow_repurchase',
+      'bundle_send_email',
+      'refund_policy_content',
+      'terms_privacy_content',
+      'about_us_content',
+      'social_instagram_enabled',
+      'social_instagram_url',
+      'social_whatsapp_enabled',
+      'social_whatsapp_url',
+      'social_twitter_enabled',
+      'social_twitter_url',
+      'social_facebook_enabled',
+      'social_facebook_url',
+      'social_telegram_enabled',
+      'social_telegram_url',
+      'floating_support_enabled',
+      'floating_whatsapp_enabled',
+      'floating_telegram_enabled',
+      'floating_phone_enabled',
+      'floating_email_enabled',
+      'support_bot_enabled',
+      'openrouter_api_key',
+      'support_bot_model_mode',
+      'openrouter_model',
+      'support_bot_prompt',
+      'custom_social_links'
+    ];
+
+    fields.forEach((field) => {
+      if (payload[field] !== undefined) {
+        if (field === 'refund_policy_content' || field === 'terms_privacy_content' || field === 'about_us_content') {
+          settings[field] = sanitizeRichText(payload[field]);
+        } else {
+          settings[field] = payload[field];
+        }
+      }
+    });
+
+    if (payload.bundle_price !== undefined || payload.bundle_original_price !== undefined) {
+      const bundlePrice = Number(payload.bundle_price ?? settings.bundle_price);
+      const originalPrice = Number(payload.bundle_original_price ?? settings.bundle_original_price);
+
+      if (!Number.isFinite(bundlePrice) || bundlePrice < 1) {
+        return NextResponse.json({ flag: 0, message: 'Bundle price must be at least Rs 1' }, { status: 400 });
+      }
+      if (!Number.isFinite(originalPrice) || originalPrice < 1) {
+        return NextResponse.json({ flag: 0, message: 'Original price must be at least Rs 1' }, { status: 400 });
+      }
+      if (bundlePrice > originalPrice) {
+        return NextResponse.json({ flag: 0, message: 'Sale price must be less than or equal to original price' }, { status: 400 });
+      }
+
+      settings.bundle_price = Math.round(bundlePrice);
+      settings.bundle_original_price = Math.round(originalPrice);
+    }
+
+    await settings.save();
+    return NextResponse.json({ flag: 1, message: 'Settings updated successfully', settings: getAdminSettings(settings.toObject()) });
+  } catch (e) {
+    console.error('[Settings] POST error:', e);
+    return NextResponse.json({ flag: 0, message: 'Server error' }, { status: 500 });
+  }
+}
